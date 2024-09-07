@@ -52,6 +52,7 @@ namespace vulkan {
     using result_t = VkResult;
 #endif
 
+    class graphicsBasePlus;
 
     class graphicsBase {
         uint32_t apiVersion = VK_API_VERSION_1_0;
@@ -91,6 +92,8 @@ namespace vulkan {
 
         //当前取得的交换链图像索引
         uint32_t currentImageIndex = 0;
+
+        graphicsBasePlus* pPlus = nullptr;
 
         //静态变量
         static graphicsBase singleton;
@@ -284,6 +287,11 @@ namespace vulkan {
         }
 
         //Getter
+        //*pPlus的Getter
+        static graphicsBasePlus& Plus() { return *singleton.pPlus; }
+        //*pPlus的Setter，只允许设置pPlus一次
+        static void Plus(graphicsBasePlus& plus) { if (!singleton.pPlus) singleton.pPlus = &plus; }
+
         uint32_t CurrentImageIndex() const { return currentImageIndex; }
 
         result_t SwapImage(VkSemaphore semaphore_imageIsAvailable) {
@@ -959,6 +967,43 @@ if constexpr (ENABLE_DEBUG_MESSENGER)
             return SubmitCommandBuffer_Compute(submitInfo, fence);
         }
 
+        result_t SubmitCommandBuffer_Presentation(VkCommandBuffer commandBuffer,
+            VkSemaphore semaphore_renderingIsOver = VK_NULL_HANDLE, VkSemaphore semaphore_ownershipIsTransfered = VK_NULL_HANDLE, VkFence fence = VK_NULL_HANDLE) const {
+            static constexpr VkPipelineStageFlags waitDstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            VkSubmitInfo submitInfo = {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &commandBuffer
+            };
+            if (semaphore_renderingIsOver)
+                submitInfo.waitSemaphoreCount = 1,
+                submitInfo.pWaitSemaphores = &semaphore_renderingIsOver,
+                submitInfo.pWaitDstStageMask = &waitDstStage;
+            if (semaphore_ownershipIsTransfered)
+                submitInfo.signalSemaphoreCount = 1,
+                submitInfo.pSignalSemaphores = &semaphore_ownershipIsTransfered;
+            VkResult result = vkQueueSubmit(queue_presentation, 1, &submitInfo, fence);
+            if (result)
+                outStream << std::format("[ graphicsBase ] ERROR\nFailed to submit the presentation command buffer!\nError code: {}\n", int32_t(result));
+            return result;
+        }
+
+        void CmdTransferImageOwnership(VkCommandBuffer commandBuffer) const {
+            VkImageMemoryBarrier imageMemoryBarrier_g2p = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstAccessMask = 0,
+                .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                .srcQueueFamilyIndex = queueFamilyIndex_graphics,
+                .dstQueueFamilyIndex = queueFamilyIndex_presentation,
+                .image = swapchainImages[currentImageIndex],
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+            };
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                0, nullptr, 0, nullptr, 1, &imageMemoryBarrier_g2p);
+        }
+
         result_t PresentImage(VkPresentInfoKHR& presentInfo) {
             presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
             switch (VkResult result = vkQueuePresentKHR(queue_presentation, &presentInfo)) {
@@ -1078,6 +1123,77 @@ if constexpr (ENABLE_DEBUG_MESSENGER)
             return Create(createInfo);
         }
     };
+
+    class event {
+        VkEvent handle = VK_NULL_HANDLE;
+    public:
+        //event() = default;
+        event(VkEventCreateInfo& createInfo) {
+            Create(createInfo);
+        }
+        event(VkEventCreateFlags flags = 0) {
+            Create(flags);
+        }
+        event(event&& other) noexcept { MoveHandle; }
+        ~event() { DestroyHandleBy(vkDestroyEvent); }
+        //Getter
+        DefineHandleTypeOperator;
+        DefineAddressFunction;
+        //Const Function
+        void CmdSet(VkCommandBuffer commandBuffer, VkPipelineStageFlags stage_from) const {
+            vkCmdSetEvent(commandBuffer, handle, stage_from);
+        }
+        void CmdReset(VkCommandBuffer commandBuffer, VkPipelineStageFlags stage_from) const {
+            vkCmdResetEvent(commandBuffer, handle, stage_from);
+        }
+        void CmdWait(VkCommandBuffer commandBuffer, VkPipelineStageFlags stage_from, VkPipelineStageFlags stage_to,
+            arrayRef<VkMemoryBarrier> memoryBarriers, arrayRef<VkBufferMemoryBarrier> bufferMemoryBarriers,
+            arrayRef<VkImageMemoryBarrier> imageMemoryBarriers) const {
+            for (auto& i : memoryBarriers)
+                i.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            for (auto& i : bufferMemoryBarriers)
+                i.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            for (auto& i : imageMemoryBarriers)
+                i.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            vkCmdWaitEvents(commandBuffer, 1, &handle, stage_from, stage_to,
+                memoryBarriers.Count(), memoryBarriers.Pointer(),
+                bufferMemoryBarriers.Count(), bufferMemoryBarriers.Pointer(),
+                imageMemoryBarriers.Count(), imageMemoryBarriers.Pointer());
+        }
+        result_t Set() const {
+            VkResult result = vkSetEvent(graphicsBase::Base().Device(), handle);
+            if (result)
+                outStream << std::format("[ event ] ERROR\nFailed to singal the event!\nError code: {}\n", int32_t(result));
+            return result;
+        }
+        result_t Reset() const {
+            VkResult result = vkResetEvent(graphicsBase::Base().Device(), handle);
+            if (result)
+                outStream << std::format("[ event ] ERROR\nFailed to unsingal the event!\nError code: {}\n", int32_t(result));
+            return result;
+        }
+        result_t Status() const {
+            VkResult result = vkGetEventStatus(graphicsBase::Base().Device(), handle);
+            if (result < 0) //vkGetEventStatus(...)成功时有两种结果
+                outStream << std::format("[ event ] ERROR\nFailed to get the status of the event!\nError code: {}\n", int32_t(result));
+            return result;
+        }
+        //Non-const Function
+        result_t Create(VkEventCreateInfo& createInfo) {
+            createInfo.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
+            VkResult result = vkCreateEvent(graphicsBase::Base().Device(), &createInfo, nullptr, &handle);
+            if (result)
+                outStream << std::format("[ event ] ERROR\nFailed to create a event!\nError code: {}\n", int32_t(result));
+            return result;
+        }
+        result_t Create(VkEventCreateFlags flags = 0) {
+            VkEventCreateInfo createInfo = {
+                .flags = flags
+            };
+            return Create(createInfo);
+        }
+    };
+
 
     class commandBuffer {
         friend class commandPool;//封装命令池的commandPool类负责分配和释放命令缓冲区，需要让其能访问私有成员handle
