@@ -1,5 +1,6 @@
 #include "GlfwGeneral.hpp"
 #include "easyVulkan.hpp"
+#include <thread>
 
 using namespace vulkan;
 
@@ -63,6 +64,9 @@ void CreatePipeline() {
 int main() {
     if (!InitializeWindow({ 1280,720 }))
         return -1;//来个你讨厌的返回值
+
+    //easyVulkan::BootScreen("../resources/image.png", VK_FORMAT_R8G8B8A8_UNORM);
+    //std::this_thread::sleep_for(std::chrono::seconds(1));
 
     const auto& [renderPass, framebuffers] = RenderPassAndFramebuffers();
     CreateLayout();

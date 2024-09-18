@@ -490,4 +490,158 @@ namespace vulkan {
         }
     };
 
+    class texture {
+    protected:
+        static std::unique_ptr<uint8_t[]> LoadFile_Internal(
+            const auto* address,             //字符串指针，或资源的内存地址
+            size_t fileSize,                 //文件大小，当且仅当传入的是资源的内存地址时有需要
+            VkExtent2D& extent,              //图像大小，将由stb_image的函数写入
+            formatInfo requiredFormatInfo) { //对读取所得数据的格式要求
+#ifndef NDEBUG
+            if (!(requiredFormatInfo.rawDataType == formatInfo::floatingPoint && requiredFormatInfo.sizePerComponent == 4) &&
+                !(requiredFormatInfo.rawDataType == formatInfo::integer && Between_Closed<int32_t>(1, requiredFormatInfo.sizePerComponent, 2)))
+                outStream << std::format("[ texture ] ERROR\nRequired format is not available for source image data!\n"),
+                abort();
+#endif
+            int& width = reinterpret_cast<int&>(extent.width);
+            int& height = reinterpret_cast<int&>(extent.height);
+            int channelCount;
+            void* pImageData = nullptr;
+            if constexpr (std::same_as<decltype(address), const char*>) {
+                if (requiredFormatInfo.rawDataType == formatInfo::integer)
+                    if (requiredFormatInfo.sizePerComponent == 1)
+                        pImageData = stbi_load(address, &width, &height, &channelCount, requiredFormatInfo.componentCount);
+                    else
+                        pImageData = stbi_load_16(address, &width, &height, &channelCount, requiredFormatInfo.componentCount);
+                else
+                    pImageData = stbi_loadf(address, &width, &height, &channelCount, requiredFormatInfo.componentCount);
+                if (!pImageData)
+                    outStream << std::format("[ texture ] ERROR\nFailed to load the file: {}\n", address);
+            }
+            if constexpr (std::same_as<decltype(address), const uint8_t*>) {
+                if (fileSize > INT32_MAX) {
+                    outStream << std::format("[ texture ] ERROR\nFailed to load image data from the given address! Data size must be less than 2G!\n");
+                    return {};
+                }
+                if (requiredFormatInfo.rawDataType == formatInfo::integer)
+                    if (requiredFormatInfo.sizePerComponent == 1)
+                        pImageData = stbi_load_from_memory(address, fileSize, &width, &height, &channelCount, requiredFormatInfo.componentCount);
+                    else
+                        pImageData = stbi_load_16_from_memory(address, fileSize, &width, &height, &channelCount, requiredFormatInfo.componentCount);
+                else
+                    pImageData = stbi_loadf_from_memory(address, fileSize, &width, &height, &channelCount, requiredFormatInfo.componentCount);
+                if (!pImageData)
+                    outStream << std::format("[ texture ] ERROR\nFailed to load image data from the given address!\n");
+            }
+            return std::unique_ptr<uint8_t[]>(static_cast<uint8_t*>(pImageData));
+        }
+
+    public:
+        [[nodiscard]]
+        static std::unique_ptr<uint8_t[]> LoadFile(const char* filepath, VkExtent2D& extent, formatInfo requiredFormatInfo) {
+            return LoadFile_Internal(filepath, 0, extent, requiredFormatInfo);
+        }
+
+        [[nodiscard]]
+        static std::unique_ptr<uint8_t[]> LoadFile(const uint8_t* fileBinaries, size_t fileSize, VkExtent2D& extent, formatInfo requiredFormatInfo) {
+            return LoadFile_Internal(fileBinaries, fileSize, extent, requiredFormatInfo);
+        }
+
+        std::pair<const uint8_t*, size_t> LoadResourceFromModule(int32_t resourceId, HMODULE hModule = NULL) {
+            if (HRSRC hResource = FindResource(hModule, MAKEINTRESOURCE(resourceId), RT_RCDATA))
+                if (HGLOBAL hData = LoadResource(hModule, hResource))
+                    if (const uint8_t* pData = static_cast<uint8_t*>(LockResource(hData)))
+                        return { pData, SizeofResource(hModule, hResource) };
+            return {};
+        }
+    };
+
+
+    struct imageOperation {
+        struct imageMemoryBarrierParameterPack {
+            const bool isNeeded = false;                            //是否需要屏障，默认为false
+            const VkPipelineStageFlags stage = 0;                   //srcStages或dstStages
+            const VkAccessFlags access = 0;                         //srcAccessMask或dstAccessMask
+            const VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED; //oldLayout或newLayout
+            //默认构造器，isNeeded保留为false
+            constexpr imageMemoryBarrierParameterPack() = default;
+            //若指定参数，三个参数必须被全部显示指定，isNeeded被赋值为true
+            constexpr imageMemoryBarrierParameterPack(VkPipelineStageFlags stage, VkAccessFlags access, VkImageLayout layout) :
+                isNeeded(true), stage(stage), access(access), layout(layout) {}
+        };
+        static void CmdCopyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer buffer, VkImage image, const VkBufferImageCopy& region,
+            imageMemoryBarrierParameterPack imb_from, imageMemoryBarrierParameterPack imb_to) {
+            VkImageMemoryBarrier imageMemoryBarrier = {
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                nullptr,
+                imb_from.access,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                imb_from.layout,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_QUEUE_FAMILY_IGNORED, //无队列族所有权转移
+                VK_QUEUE_FAMILY_IGNORED,
+                image,
+                {
+                    region.imageSubresource.aspectMask,
+                    region.imageSubresource.mipLevel,
+                    1,
+                    region.imageSubresource.baseArrayLayer,
+                    region.imageSubresource.layerCount 
+                }
+            };
+            if (imb_from.isNeeded)
+                vkCmdPipelineBarrier(commandBuffer, imb_from.stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                    0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+
+            vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+            //若拷贝后需要管线屏障
+            if (imb_to.isNeeded) {
+                imageMemoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                imageMemoryBarrier.dstAccessMask = imb_to.access;
+                imageMemoryBarrier.newLayout = imb_to.layout;
+                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, imb_to.stage, 0,
+                    0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+            }
+        }
+
+        static void CmdBlitImage(VkCommandBuffer commandBuffer, VkImage image_src, VkImage image_dst, const VkImageBlit& region,
+            imageMemoryBarrierParameterPack imb_dst_from, imageMemoryBarrierParameterPack imb_dst_to, VkFilter filter = VK_FILTER_LINEAR) {
+            VkImageMemoryBarrier imageMemoryBarrier = {
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                nullptr,
+                imb_dst_from.access,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                imb_dst_from.layout,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_QUEUE_FAMILY_IGNORED,
+                VK_QUEUE_FAMILY_IGNORED,
+                image_dst,
+                {
+                    region.dstSubresource.aspectMask,
+                    region.dstSubresource.mipLevel,
+                    1,
+                    region.dstSubresource.baseArrayLayer,
+                    region.dstSubresource.layerCount 
+                }
+            };
+            if (imb_dst_from.isNeeded)
+                vkCmdPipelineBarrier(commandBuffer, imb_dst_from.stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                    0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+            vkCmdBlitImage(commandBuffer,
+                image_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                image_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &region, filter);
+            if (imb_dst_to.isNeeded) {
+                imageMemoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                imageMemoryBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                imageMemoryBarrier.dstAccessMask = imb_dst_to.access;
+                imageMemoryBarrier.newLayout = imb_dst_to.layout;
+                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, imb_dst_to.stage, 0,
+                    0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
+            }
+        }
+    };
+
 }
